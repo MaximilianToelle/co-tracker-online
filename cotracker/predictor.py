@@ -222,7 +222,8 @@ class CoTrackerOnlinePredictor(torch.nn.Module):
         self.support_grid_size = 6
         model = build_cotracker(checkpoint, v2=v2, offline=False, window_len=window_len)
         self.interp_shape = model.model_resolution
-        self.step = model.window_len // 2
+        # self.step = model.window_len // 2
+        self.step = 1
         self.model = model
         self.model.eval()
 
