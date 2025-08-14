@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+
+[project]
+name = "cotracker"
+version = "0.1.0"
+requires-python = ">=3.10"
+description = '"CoTracker is a fast transformer-based model that can track any point in a video"'
+readme = "README.md"
+
+[tool.setuptools.packages.find]
+include = ["cotracker*"]
+
+[tool.setuptools.package-data]
+"cotracker.conf" = ["*.yaml"]

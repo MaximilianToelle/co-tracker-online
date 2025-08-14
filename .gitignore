@@ -1,0 +1,8 @@
+# Build / packaging metadata
+*.egg-info/
+
+# Python cache files
+__pycache__/
+
+# Model checkpoints
+checkpoints/

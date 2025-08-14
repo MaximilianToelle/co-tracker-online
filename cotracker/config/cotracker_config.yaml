@@ -1,0 +1,3 @@
+cotracker:
+  num_queries: 200        
+  grid_query_frame: 0
