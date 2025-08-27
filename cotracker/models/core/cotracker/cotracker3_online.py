@@ -111,7 +111,7 @@ class CoTrackerThreeBase(nn.Module):
             return coords_lvl
 
     def get_track_feat(self, fmaps, queried_frames, queried_coords, support_radius=0):
-
+        # NOTE: sample_frames describes the timestep of our queries in the past relative to now
         sample_frames = queried_frames[:, None, :, None]
         sample_coords = torch.cat(
             [
@@ -119,8 +119,10 @@ class CoTrackerThreeBase(nn.Module):
                 queried_coords[:, None],
             ],
             dim=-1,
-        )
+        )   # (txy)
         support_points = self.get_support_points(sample_coords, support_radius)
+        # NOTE: sample_features5d uses F.grid_sample under the hood
+        # What happens with negative time t due to queries being in the past? 
         support_track_feats = sample_features5d(fmaps, support_points)
         return (
             support_track_feats[:, None, support_track_feats.shape[1] // 2],
@@ -168,6 +170,9 @@ class CoTrackerThreeOnline(CoTrackerThreeBase):
         self.online_vis_predicted = None
         self.online_conf_predicted = None
 
+        self.fmaps = None
+        self.fmaps_pyramid = []
+
     def forward_window(
         self,
         fmaps_pyramid,
@@ -186,7 +191,8 @@ class CoTrackerThreeOnline(CoTrackerThreeBase):
         coord_preds, vis_preds, conf_preds = [], [], []
         for it in range(iters):
             coords = coords.detach()  # B T N 2
-            coords_init = coords.view(B * S, N, 2)
+            coords_init = coords.reshape(B * S, N, 2)
+            coords_init = coords_init.view(B * S, N, 2)
             corr_embs = []
             corr_feats = []
             for i in range(self.corr_levels):
@@ -381,43 +387,69 @@ class CoTrackerThreeOnline(CoTrackerThreeBase):
                 fmaps.append(fmaps_chunk.reshape(B, T_chunk, C_chunk, H_chunk, W_chunk))
             fmaps = torch.cat(fmaps, dim=1).reshape(-1, C_chunk, H_chunk, W_chunk)
         else:
-            fmaps = self.fnet(video.reshape(-1, C_, H, W))
-        fmaps = fmaps.permute(0, 2, 3, 1)
-        fmaps = fmaps / torch.sqrt(
-            torch.maximum(
-                torch.sum(torch.square(fmaps), axis=-1, keepdims=True),
-                torch.tensor(1e-12, device=fmaps.device),
-            )
-        )
-        fmaps = fmaps.permute(0, 3, 1, 2).reshape(
-            B, -1, self.latent_dim, H // self.stride, W // self.stride
-        )
-        fmaps = fmaps.to(dtype)
+            # online mode
+            if self.fmaps is not None:
+                # online process received new frames at timestep -1
+                to_process = video[:, -1, ...]
+                fmaps = self.fnet(to_process)
+                fmaps = F.normalize(fmaps, p=2, dim=1, eps=1e-12)   
+                fmaps = fmaps.to(dtype)
+                # deque on torch.tensor 
+                self.fmaps[:, :-1] = self.fmaps[:, 1:]
+                self.fmaps[:, -1, ...] = fmaps
+            else: 
+                # initial time step
+                fmaps = self.fnet(video.reshape(-1, C_, H, W))
+                fmaps = F.normalize(fmaps, p=2, dim=1, eps=1e-12)
+                self.fmaps = fmaps.view(B, T_pad, self.latent_dim, H4, W4).to(dtype) 
 
-        # We compute track features
-        fmaps_pyramid = []
-        track_feat_pyramid = []
-        track_feat_support_pyramid = []
-        fmaps_pyramid.append(fmaps)
-        for i in range(self.corr_levels - 1):
-            fmaps_ = fmaps.reshape(
-                B * T_pad, self.latent_dim, fmaps.shape[-2], fmaps.shape[-1]
-            )
-            fmaps_ = F.avg_pool2d(fmaps_, 2, stride=2)
-            fmaps = fmaps_.reshape(
-                B, T_pad, self.latent_dim, fmaps_.shape[-2], fmaps_.shape[-1]
-            )
-            fmaps_pyramid.append(fmaps)
+        # NOTE: F.normalize above provides speedup of ~3 orders of magnitude from ~8e-2 to ~8e-5 seconds!
+        # fmaps = fmaps.permute(0, 2, 3, 1)
+        # fmaps = fmaps / torch.sqrt(
+        #     torch.maximum(
+        #         torch.sum(torch.square(fmaps), axis=-1, keepdims=True),
+        #         torch.tensor(1e-12, device=fmaps.device),
+        #     )
+        # )
+        # fmaps = fmaps.permute(0, 3, 1, 2).reshape(
+        #     B, -1, self.latent_dim, H // self.stride, W // self.stride
+        # )
+
+        if not self.fmaps_pyramid:
+            self.fmaps_pyramid.append(self.fmaps)
+            fmaps = self.fmaps
+            for i in range(self.corr_levels - 1):
+                fmaps_ = fmaps.reshape(
+                    B * T_pad, self.latent_dim, fmaps.shape[-2], fmaps.shape[-1]
+                )
+                fmaps_ = F.avg_pool2d(fmaps_, 2, stride=2)
+                fmaps = fmaps_.reshape(
+                    B, T_pad, self.latent_dim, fmaps_.shape[-2], fmaps_.shape[-1]
+                )
+                self.fmaps_pyramid.append(fmaps)
+        else:
+            fmap = self.fmaps[:, -1, ...]
+            # deque on torch.tensor 
+            self.fmaps_pyramid[0][:, :-1] = self.fmaps_pyramid[0][:, 1:]
+            self.fmaps_pyramid[0][:, -1, ...] = fmap
+            for i in range(self.corr_levels - 1):
+                # deque on torch.tensor 
+                self.fmaps_pyramid[i+1][:, :-1] = self.fmaps_pyramid[i+1][:, 1:]
+                fmap = F.avg_pool2d(fmap, 2, stride=2)
+                self.fmaps_pyramid[i+1][:, -1, ...] = fmap  
+        
         if is_online:
             sample_frames = queried_frames[:, None, :, None]  # B 1 N 1
             left = 0 if self.online_ind == 0 else self.online_ind + step
             right = self.online_ind + S
             sample_mask = (sample_frames >= left) & (sample_frames < right)
 
+        track_feat_support_pyramid = []
         for i in range(self.corr_levels):
+            # NOTE: changes over time, so we do the computation at every time step
             track_feat, track_feat_support = self.get_track_feat(
-                fmaps_pyramid[i],
-                queried_frames - self.online_ind if is_online else queried_frames,
+                self.fmaps_pyramid[i],
+                queried_frames - self.online_ind if is_online else queried_frames,      # how many timesteps are the queries in the past
                 queried_coords / 2**i,
                 support_radius=self.corr_radius,
             )
@@ -433,18 +465,11 @@ class CoTrackerThreeOnline(CoTrackerThreeBase):
 
                 self.online_track_feat[i] += track_feat * sample_mask
                 self.online_track_support[i] += track_feat_support * sample_mask
-                track_feat_pyramid.append(
-                    self.online_track_feat[i].repeat(1, T_pad, 1, 1)
-                )
                 track_feat_support_pyramid.append(
                     self.online_track_support[i].unsqueeze(1)
                 )
             else:
-                track_feat_pyramid.append(track_feat.repeat(1, T_pad, 1, 1))
                 track_feat_support_pyramid.append(track_feat_support.unsqueeze(1))
-
-        D_coords = 2
-        coord_preds, vis_preds, confidence_preds = [], [], []
 
         vis_init = torch.zeros((B, S, N, 1), device=device).float()
         conf_init = torch.zeros((B, S, N, 1), device=device).float()
@@ -456,6 +481,7 @@ class CoTrackerThreeOnline(CoTrackerThreeBase):
 
         for ind in indices:
             if ind > 0:
+                # NOTE: taking previously predicted tracks as init for next prediction
                 overlap = S - step
                 copy_over = (queried_frames < ind + overlap)[
                     :, None, :, None
@@ -486,9 +512,9 @@ class CoTrackerThreeOnline(CoTrackerThreeBase):
             # import ipdb; ipdb.set_trace()
             coords, viss, confs = self.forward_window(
                 fmaps_pyramid=(
-                    fmaps_pyramid
+                    self.fmaps_pyramid
                     if is_online
-                    else [fmap[:, ind : ind + S] for fmap in fmaps_pyramid]
+                    else [fmap[:, ind : ind + S] for fmap in self.fmaps_pyramid]
                 ),
                 coords=coords_init,
                 track_feat_support_pyramid=[
