@@ -1,3 +1,4 @@
 cotracker:
-  num_queries: 200        
+  num_queries: 50   
   grid_query_frame: 0
+  replace_query_after_num_invisible_timesteps: 8
